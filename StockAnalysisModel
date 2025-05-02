@@ -1,0 +1,211 @@
+# Stock Analysis App for Google Colab
+# Instructions:
+# 1. Open Google Colab (colab.research.google.com).
+# 2. Create a new notebook.
+# 3. Copy and paste this entire code into a single code cell.
+# 4. Run the cell. It will install dependencies and display a text input and button.
+# 5. Enter a stock ticker (e.g., THEON.AS for Amsterdam, AAPL for NASDAQ) and click "Analyze Stock".
+# 6. View the results below the input.
+
+# Install dependencies
+!pip install yfinance pandas numpy scikit-learn ipywidgets -q
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+import warnings
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+warnings.filterwarnings('ignore')
+
+def get_stock_data(ticker, period='5y'):
+    """Fetch historical stock data and financial metrics."""
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period=period)
+    
+    # Check if historical data is empty
+    if hist.empty:
+        # Try appending common exchange suffixes for European stocks
+        suffixes = ['.AS', '.PA', '.DE', '.L']
+        for suffix in suffixes:
+            try:
+                stock = yf.Ticker(ticker + suffix)
+                hist = stock.history(period=period)
+                if not hist.empty:
+                    ticker = ticker + suffix
+                    break
+            except:
+                continue
+        if hist.empty:
+            raise ValueError(f"No price data found for {ticker}. It may be delisted or the ticker may be incorrect. Try including the exchange suffix (e.g., THEON.AS for Amsterdam).")
+    
+    # Calculate technical indicators
+    hist['MA50'] = hist['Close'].rolling(window=50).mean()
+    hist['MA200'] = hist['Close'].rolling(window=200).mean()
+    hist['Volatility'] = hist['Close'].rolling(window=50).std()
+    hist['Momentum'] = hist['Close'].pct_change(periods=10)
+    hist['RSI'] = compute_rsi(hist['Close'])
+    
+    # Fetch fundamental data
+    info = stock.info
+    if not info or 'symbol' not in info:
+        raise ValueError(f"No financial data found for {ticker}. Please check the ticker.")
+    
+    fundamentals = {
+        'PE_Ratio': info.get('trailingPE', np.nan),
+        'EPS': info.get('trailingEps', np.nan),
+        'Revenue_Growth': info.get('revenueGrowth', np.nan),
+        'Debt_to_Equity': info.get('debtToEquity', np.nan),
+        'ROE': info.get('returnOnEquity', np.nan)
+    }
+    return hist, fundamentals, ticker
+
+def compute_rsi(series, periods=14):
+    """Calculate Relative Strength Index (RSI)."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def get_sentiment(ticker):
+    """Placeholder for sentiment analysis (e.g., from X posts or news)."""
+    # Simulate no sentiment data available (replace with real API if available)
+    return None  # Returning None to indicate no data
+
+def prepare_data(hist, fundamentals, sentiment=None):
+    """Prepare features for the ML model."""
+    df = hist[['Close', 'MA50', 'MA200', 'Volatility', 'Momentum', 'RSI']].dropna()
+    
+    # Add fundamental features
+    for key, value in fundamentals.items():
+        df[key] = value
+    
+    # Add sentiment if available
+    if sentiment is not None:
+        df['Sentiment'] = sentiment
+    
+    # Target: Future 1-month return
+    df['Future_Return'] = df['Close'].pct_change(periods=21).shift(-21)
+    df = df.dropna()
+    
+    # Check if enough data remains after dropping NaNs
+    if len(df) < 2:
+        raise ValueError("Insufficient data after processing. Try a shorter period or check the ticker.")
+    
+    return df
+
+def train_model(df):
+    """Train a Random Forest model to predict future returns."""
+    X = df.drop(['Future_Return', 'Close'], axis=1)
+    y = df['Future_Return']
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train_scaled, y_train)
+    
+    score = model.score(X_test_scaled, y_test)
+    return model, scaler, score
+
+def evaluate_investment(ticker):
+    """Evaluate if the company is worth investing in."""
+    # Get data
+    hist, fundamentals, ticker = get_stock_data(ticker)
+    sentiment = get_sentiment(ticker)
+    df = prepare_data(hist, fundamentals, sentiment)
+    
+    # Train model
+    model, scaler, score = train_model(df)
+    
+    # Predict future return for the latest data
+    latest_data = df.drop(['Future_Return', 'Close'], axis=1).iloc[-1:]
+    latest_scaled = scaler.transform(latest_data)
+    predicted_return = model.predict(latest_scaled)[0]
+    
+    # Scoring system
+    explanation = ""
+    if sentiment is not None:
+        # Use original weights with Sentiment (40%, 20%, 10%, 10%, 10%, 10%)
+        score_dict = {
+            'Predicted_Return': min(predicted_return * 40, 40),  # Weight: 40%
+            'PE_Ratio': max(0, (30 - fundamentals['PE_Ratio']) / 30) * 20 if fundamentals['PE_Ratio'] else 0,  # Weight: 20%
+            'EPS': min(fundamentals['EPS'] * 10, 10) if fundamentals['EPS'] else 0,  # Weight: 10%
+            'Revenue_Growth': min(fundamentals['Revenue_Growth'] * 10, 10) if fundamentals['Revenue_Growth'] else 0,  # Weight: 10%
+            'Sentiment': min(sentiment * 10, 10),  # Weight: 10%
+            'Model_Accuracy': min(score * 10, 10)  # Weight: 10%
+        }
+    else:
+        # No sentiment data: remove Sentiment, redistribute weights (44.44%, 22.22%, 11.11%, 11.11%, 11.11%)
+        score_dict = {
+            'Predicted_Return': min(predicted_return * 44.44, 44.44),  # Weight: 44.44%
+            'PE_Ratio': max(0, (30 - fundamentals['PE_Ratio']) / 30) * 22.22 if fundamentals['PE_Ratio'] else 0,  # Weight: 22.22%
+            'EPS': min(fundamentals['EPS'] * 11.11, 11.11) if fundamentals['EPS'] else 0,  # Weight: 11.11%
+            'Revenue_Growth': min(fundamentals['Revenue_Growth'] * 11.11, 11.11) if fundamentals['Revenue_Growth'] else 0,  # Weight: 11.11%
+            'Model_Accuracy': min(score * 11.11, 11.11)  # Weight: 11.11%
+        }
+        explanation = "Note: Sentiment data was not available for this ticker. The Sentiment component (10% weight) was removed, and its weight was redistributed proportionally to other components."
+    
+    total_score = sum(score_dict.values())
+    
+    # Investment recommendation
+    recommendation = "Strong Buy" if total_score > 80 else "Buy" if total_score > 50 else "Hold" if total_score > 20 else "Sell"
+    
+    return {
+        'Ticker': ticker,
+        'Total_Score': round(total_score, 2),
+        'Recommendation': recommendation,
+        'Details': {k: round(v, 2) for k, v in score_dict.items()},
+        'Explanation': explanation
+    }
+
+# Create interactive widgets
+ticker_input = widgets.Text(
+    value='',
+    placeholder='Enter ticker (e.g., THEON.AS, AAPL)',
+    description='Ticker:',
+    layout={'width': '500px'}
+)
+
+analyze_button = widgets.Button(
+    description='Analyze Stock',
+    button_style='success',
+    tooltip='Click to analyze the stock',
+    icon='chart-line'
+)
+
+output = widgets.Output()
+
+def on_analyze_button_clicked(b):
+    with output:
+        clear_output()
+        ticker = ticker_input.value.strip().upper()
+        if not ticker:
+            print("Please enter a ticker.")
+            return
+        try:
+            result = evaluate_investment(ticker)
+            print(f"Investment Analysis for {result['Ticker']}:")
+            print(f"Total Score: {result['Total_Score']}/100")
+            print(f"Recommendation: {result['Recommendation']}")
+            print("Details:")
+            for key, value in result['Details'].items():
+                print(f"  {key}: {value}")
+            if result['Explanation']:
+                print(result['Explanation'])
+        except Exception as e:
+            print(f"Error analyzing ticker {ticker}: {str(e)}")
+
+analyze_button.on_click(on_analyze_button_clicked)
+
+# Display the app
+display(ticker_input, analyze_button, output)
