@@ -2,34 +2,47 @@
 # Instructions:
 # 1. Open Google Colab (colab.research.google.com).
 # 2. Copy and paste this code into a single code cell.
-# 3. Run the cell to install dependencies and execute the app.
-# 4. Select a time horizon, enter a ticker (e.g., THEON.AS, AAPL), and click "Analyze Stock".
-# 5. View the results with a summary table (stars), total score (stars), and real NewsAPI headlines from Reuters, Yahoo Finance, NPR, CBS News, TheStreet, and Benzinga.
-# Note: Handles Yahoo Finance rate limits with exponential backoff and caching. If rate-limited, wait 60 seconds and retry. Headlines include source links. If fewer than 5 headlines are found, a message like "No other recent headlines found" appears. If no headlines are found, the app displays "No recent news headlines found" and may note "NewsAPI key may be invalid or rate-limited." Sentiment is based on Yahoo Finance, with a neutral score (5.0/10) if no news is available.
+# 3. (Optional, for real news headlines) Add a Colab secret named NEWSAPI_KEY with your free
+#    key from https://newsapi.org/ (key icon in the left sidebar). Without it, headlines are skipped.
+# 4. Run the cell to install dependencies and execute the app.
+# 5. Select a time horizon, enter a ticker (e.g., THEON.AS, AAPL), and click "Analyze Stock".
+# 6. View the results with a summary table (stars), total score (stars), and real NewsAPI headlines from Reuters, Yahoo Finance, NPR, CBS News, TheStreet, and Benzinga.
+# Note: Handles Yahoo Finance rate limits with exponential backoff and caching. If rate-limited, wait 60 seconds and retry. Headlines include source links. If fewer than 5 headlines are found, a message like "No other recent headlines found" appears. If no headlines are found, the app displays "No recent news headlines found" and notes whether it's due to a missing/invalid key or rate limiting. Sentiment is based on recent news headlines fetched via yfinance, with a neutral score (5.0/10) if no news is available.
 
 # Install dependencies
-!pip install yfinance pandas numpy scikit-learn ipywidgets requests beautifulsoup4 textblob -q
+!pip install yfinance pandas numpy scikit-learn ipywidgets requests textblob -q
 
+import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime, timedelta
 import warnings
 import ipywidgets as widgets
 from IPython.display import display, clear_output
 import requests
-from bs4 import BeautifulSoup
 from textblob import TextBlob
 import time
-import pickle
 
 warnings.filterwarnings('ignore')
 
-# Hardcoded NewsAPI key
-newsapi_key = "3b79c316efb74c50b14ca2f6d3b00f19"
+def _get_newsapi_key():
+    """Read the NewsAPI key from Colab secrets or an environment variable.
+    Never hardcode API keys in source: set NEWSAPI_KEY in Colab's Secrets panel
+    (key icon in the left sidebar) or as an environment variable."""
+    try:
+        from google.colab import userdata
+        key = userdata.get('NEWSAPI_KEY')
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get('NEWSAPI_KEY')
+
+newsapi_key = _get_newsapi_key()
 
 # Cache for stock data
 stock_data_cache = {}
@@ -121,32 +134,31 @@ def compute_rsi(series, periods=14):
     return 100 - (100 / (1 + rs))
 
 def get_sentiment(ticker):
-    """Fetch and analyze sentiment from Yahoo Finance news headlines."""
+    """Fetch and analyze sentiment from recent news headlines via yfinance.
+    Uses yfinance's news API instead of scraping rendered Yahoo Finance HTML,
+    since the page markup changes frequently and breaks CSS-selector scraping."""
     try:
-        url = f"https://finance.yahoo.com/quote/{ticker}/news/"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        headlines = soup.find_all('h3', class_='Mb(5px)')
-        if not headlines:
+        news_items = yf.Ticker(ticker).news or []
+        titles = []
+        for item in news_items[:5]:
+            title = item.get('title') or item.get('content', {}).get('title')
+            if title:
+                titles.append(title)
+
+        if not titles:
             return 5.0, "No news available, neutral score assigned"  # Neutral score
-        
-        sentiments = []
-        for headline in headlines[:5]:
-            text = headline.get_text()
-            analysis = TextBlob(text)
-            sentiment = analysis.sentiment.polarity  # -1 to 1
-            sentiments.append(sentiment)
-        
-        avg_sentiment = np.mean(sentiments) if sentiments else 0
+
+        sentiments = [TextBlob(title).sentiment.polarity for title in titles]  # -1 to 1
+        avg_sentiment = np.mean(sentiments)
         sentiment_score = (avg_sentiment + 1) * 5  # Convert -1:1 to 0:10
-        return min(max(sentiment_score, 0), 10), "Yahoo Finance news sentiment"
+        return min(max(sentiment_score, 0), 10), "Recent news sentiment"
     except Exception:
         return 5.0, "No news available, neutral score assigned"  # Neutral score on failure
 
 def get_news_headlines(ticker, company_name):
     """Fetch real headlines from NewsAPI, limited to Reuters, Yahoo Finance, NPR, CBS News, TheStreet, Benzinga."""
+    if not newsapi_key:
+        return None
     try:
         sources = "reuters,yahoo-finance,npr,cbs-news,thestreet,benzinga"
         url = f"https://newsapi.org/v2/everything?q={company_name}&sources={sources}&sortBy=publishedAt&apiKey={newsapi_key}"
@@ -210,12 +222,10 @@ def prepare_data(hist, fundamentals, sentiment=None, horizon_months=12):
     
     return df
 
-# Replace your current train_model() with this
 def train_model(df):
-    """Train RandomForest with chronological split; guard against tiny datasets."""
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.preprocessing import StandardScaler
-
+    """Train RandomForest; estimate accuracy via chronological (TimeSeriesSplit)
+    cross-validation, then fit the final model on all available data so the
+    latest-point prediction uses everything we know."""
     # Minimum rows for a meaningful split (tune as you like)
     MIN_ROWS = 80  # ~2-3 months of valid rows after dropna for daily data
     if len(df) < MIN_ROWS:
@@ -224,25 +234,31 @@ def train_model(df):
     X = df.drop(['Future_Return', 'Close'], axis=1)
     y = df['Future_Return']
 
-    # Chronological split with guaranteed non-empty train & test
-    split_idx = max(1, int(len(df) * 0.8))
-    if split_idx >= len(df):
-        split_idx = len(df) - 1  # ensure at least 1 sample in test
+    # Cross-validated R² across chronological folds (more robust than one split)
+    n_splits = min(5, max(2, len(df) // 50))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    fold_scores = []
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-    # Scale
+        fold_scaler = StandardScaler()
+        X_train_s = fold_scaler.fit_transform(X_train)
+        X_test_s = fold_scaler.transform(X_test)
+
+        fold_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
+        fold_model.fit(X_train_s, y_train)
+        fold_scores.append(fold_model.score(X_test_s, y_test))
+
+    r2_clamped = float(np.clip(np.mean(fold_scores), 0.0, 1.0))  # keep [0,1] for scoring
+
+    # Final model trained on all available data, used for the latest prediction
     scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s  = scaler.transform(X_test)
-
-    # Model
+    X_s = scaler.fit_transform(X)
     model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
-    model.fit(X_train_s, y_train)
+    model.fit(X_s, y)
 
-    r2 = model.score(X_test_s, y_test)
-    r2_clamped = float(np.clip(r2, 0.0, 1.0))  # keep [0,1] for scoring
     return model, scaler, r2_clamped
 
 def score_to_stars(score):
@@ -272,6 +288,11 @@ def total_score_to_stars(total_score):
     else:
         return '★★★★★'
 
+def clip_score(x):
+    """Clamp a sub-score to the [0, 10] range so a single extreme metric
+    (e.g. negative P/E or EPS) can't drag or inflate the total score."""
+    return float(min(max(x, 0), 10))
+
 def evaluate_investment(ticker, horizon_months=12, period ='max'):
     """Evaluate the company with Morningstar-inspired presentation."""
     hist, fundamentals, ticker = get_stock_data(ticker, period=period)
@@ -297,66 +318,71 @@ def evaluate_investment(ticker, horizon_months=12, period ='max'):
     # Scoring system
     explanation = ""
     score_dict = {}
+
+    market_cap = fundamentals['Market_Cap']
+    fcf_yield = (fundamentals['Free_Cash_Flow'] / market_cap) if market_cap else 0.0
+    sector_resilience = get_sector_resilience(fundamentals['Sector'])
+
     if sentiment is not None:
         score_dict = {
             'Predicted_Return': {
                 'value': predicted_return * 100,
-                'score': min(max(0, predicted_return / 0.2 * 10), 10),
+                'score': clip_score(predicted_return / 0.2 * 10),
                 'note': f"Expected percentage change in stock price over the horizon. {'Favorable' if predicted_return >= 0 else 'Unfavorable, contributes 0 points'}{capped_note}",
                 'weight': 25
             },
             'PE_Ratio': {
                 'value': fundamentals['PE_Ratio'],
-                'score': max(0, (30 - fundamentals['PE_Ratio']) / 30 * 10),
+                'score': clip_score((30 - fundamentals['PE_Ratio']) / 30 * 10),
                 'note': 'Slightly above average, lower is better',
                 'weight': 10
             },
             'EPS': {
                 'value': fundamentals['EPS'],
-                'score': min(fundamentals['EPS'] / 5 * 10, 10),
+                'score': clip_score(fundamentals['EPS'] / 5 * 10),
                 'note': '',
                 'weight': 10
             },
             'Revenue_Growth': {
                 'value': fundamentals['Revenue_Growth'] * 100,
-                'score': min(fundamentals['Revenue_Growth'] / 0.3 * 10, 10),
+                'score': clip_score(fundamentals['Revenue_Growth'] / 0.3 * 10),
                 'note': '',
                 'weight': 10
             },
             'Free_Cash_Flow': {
-                'value': (fundamentals['Free_Cash_Flow'] / fundamentals['Market_Cap'] * 100),
-                'score': min(fundamentals['Free_Cash_Flow'] / fundamentals['Market_Cap'] / 0.05 * 10, 10),
+                'value': fcf_yield * 100,
+                'score': clip_score(fcf_yield / 0.05 * 10),
                 'note': 'Yield',
                 'weight': 10
             },
             'ROE': {
                 'value': fundamentals['ROE'] * 100,
-                'score': min(fundamentals['ROE'] / 0.5 * 10, 10),
+                'score': clip_score(fundamentals['ROE'] / 0.5 * 10),
                 'note': '',
                 'weight': 10
             },
             'Debt_to_Equity': {
                 'value': fundamentals['Debt_to_Equity'],
-                'score': max(0, (2 - fundamentals['Debt_to_Equity']) / 2 * 10),
+                'score': clip_score((2 - fundamentals['Debt_to_Equity']) / 2 * 10),
                 'note': 'Favorable, lower is better',
                 'weight': 5
             },
             'Sentiment': {
                 'value': sentiment,
-                'score': sentiment,
+                'score': clip_score(sentiment),
                 'note': sentiment_note,
                 'weight': 10
             },
             'Model_Accuracy': {
                 'value': score * 100,
-                'score': min(score * 10, 10),
+                'score': clip_score(score * 10),
                 'note': f'High model reliability, R²: {score*100:.0f}%',
                 'weight': 5
             },
             'Sector_Resilience': {
-                'value': get_sector_resilience(fundamentals['Sector']),
-                'score': get_sector_resilience(fundamentals['Sector']),
-                'note': 'Resilient sector outlook' if get_sector_resilience(fundamentals['Sector']) > 5 else 'Moderate sector outlook',
+                'value': sector_resilience,
+                'score': clip_score(sector_resilience),
+                'note': 'Resilient sector outlook' if sector_resilience > 5 else 'Moderate sector outlook',
                 'weight': 10
             }
         }
@@ -364,56 +390,56 @@ def evaluate_investment(ticker, horizon_months=12, period ='max'):
         score_dict = {
             'Predicted_Return': {
                 'value': predicted_return * 100,
-                'score': min(max(0, predicted_return / 0.2 * 10), 10),
+                'score': clip_score(predicted_return / 0.2 * 10),
                 'note': f"Expected percentage change in stock price over the horizon. {'Favorable' if predicted_return >= 0 else 'Unfavorable, contributes 0 points'}{capped_note}",
                 'weight': 27.78
             },
             'PE_Ratio': {
                 'value': fundamentals['PE_Ratio'],
-                'score': max(0, (30 - fundamentals['PE_Ratio']) / 30 * 10),
+                'score': clip_score((30 - fundamentals['PE_Ratio']) / 30 * 10),
                 'note': 'Slightly above average, lower is better',
                 'weight': 11.11
             },
             'EPS': {
                 'value': fundamentals['EPS'],
-                'score': min(fundamentals['EPS'] / 5 * 10, 10),
+                'score': clip_score(fundamentals['EPS'] / 5 * 10),
                 'note': '',
                 'weight': 11.11
             },
             'Revenue_Growth': {
                 'value': fundamentals['Revenue_Growth'] * 100,
-                'score': min(fundamentals['Revenue_Growth'] / 0.3 * 10, 10),
+                'score': clip_score(fundamentals['Revenue_Growth'] / 0.3 * 10),
                 'note': '',
                 'weight': 11.11
             },
             'Free_Cash_Flow': {
-                'value': (fundamentals['Free_Cash_Flow'] / fundamentals['Market_Cap'] * 100),
-                'score': min(fundamentals['Free_Cash_Flow'] / fundamentals['Market_Cap'] / 0.05 * 10, 10),
+                'value': fcf_yield * 100,
+                'score': clip_score(fcf_yield / 0.05 * 10),
                 'note': 'Yield',
                 'weight': 11.11
             },
             'ROE': {
                 'value': fundamentals['ROE'] * 100,
-                'score': min(fundamentals['ROE'] / 0.5 * 10, 10),
+                'score': clip_score(fundamentals['ROE'] / 0.5 * 10),
                 'note': '',
                 'weight': 11.11
             },
             'Debt_to_Equity': {
                 'value': fundamentals['Debt_to_Equity'],
-                'score': max(0, (2 - fundamentals['Debt_to_Equity']) / 2 * 10),
+                'score': clip_score((2 - fundamentals['Debt_to_Equity']) / 2 * 10),
                 'note': 'Favorable, lower is better',
                 'weight': 5.56
             },
             'Model_Accuracy': {
                 'value': score * 100,
-                'score': min(score * 10, 10),
+                'score': clip_score(score * 10),
                 'note': f'High model reliability, R²: {score*100:.0f}%',
                 'weight': 5.56
             },
             'Sector_Resilience': {
-                'value': get_sector_resilience(fundamentals['Sector']),
-                'score': get_sector_resilience(fundamentals['Sector']),
-                'note': 'Resilient sector outlook' if get_sector_resilience(fundamentals['Sector']) > 5 else 'Moderate sector outlook',
+                'value': sector_resilience,
+                'score': clip_score(sector_resilience),
+                'note': 'Resilient sector outlook' if sector_resilience > 5 else 'Moderate sector outlook',
                 'weight': 11.11
             }
         }
@@ -470,7 +496,11 @@ def display_results(result):
             print("No other recent headlines found.")
     else:
         print(f"No recent news headlines found for {result['Ticker']}.")
-        print("Note: NewsAPI key may be invalid or rate-limited. Please obtain a new key at https://newsapi.org/.")
+        if not newsapi_key:
+            print("Note: No NEWSAPI_KEY configured. Set it as a Colab secret (key icon in the left sidebar) "
+                  "or as an environment variable to enable headlines. Get a free key at https://newsapi.org/.")
+        else:
+            print("Note: NewsAPI key may be invalid or rate-limited. Please obtain a new key at https://newsapi.org/.")
 
 # Create interactive widgets
 horizon_dropdown = widgets.Dropdown(
